@@ -6,6 +6,8 @@ Agentic RAG — 基于 LangGraph 的智能检索智能体
   - 检索后自评质量，不行就换检索词重搜
   - 多轮思考，直到满意或达到上限
 """
+import json
+import re
 from typing import TypedDict, List, Literal
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
@@ -22,6 +24,7 @@ class AgentState(TypedDict):
     iteration: int
     max_iterations: int
     need_search: bool
+    docs_relevant: bool
     answer: str
 
 
@@ -45,37 +48,110 @@ class AgenticRAG:
         )
         self._graph = self._build_graph()
 
+    def _is_chitchat(self, question: str) -> bool:
+        """用确定性规则兜底，避免简单寒暄误进检索链路。"""
+        q = question.strip().lower()
+        chitchat_patterns = [
+            r"^(你好|您好|嗨|哈喽|hello|hi|hey)[啊呀吗！!。.\s]*$",
+            r"^(谢谢|感谢|多谢|thank you|thanks)[！!。.\s]*$",
+            r"^(再见|拜拜|bye)[！!。.\s]*$",
+        ]
+        return any(re.match(pattern, q) for pattern in chitchat_patterns)
+
+    def _clean_queries(self, raw_queries) -> List[str]:
+        """把 LLM 可能带解释的输出清洗成短检索词。"""
+        if isinstance(raw_queries, str):
+            candidates = re.split(r"[,，;；\n]+", raw_queries)
+        elif isinstance(raw_queries, list):
+            candidates = []
+            for item in raw_queries:
+                candidates.extend(re.split(r"[,，;；\n]+", str(item)))
+        else:
+            candidates = []
+
+        queries = []
+        noise_markers = ["用户", "询问", "问题", "属于", "需要检索", "不需要", "因此", "因为"]
+        for query in candidates:
+            query = query.strip().strip("-*[]()（）\"'“”")
+            query = re.sub(r"^(检索词|关键词)\s*\d*\s*[:：]\s*", "", query).strip()
+            if not query or len(query) > 30:
+                continue
+            if any(marker in query for marker in noise_markers):
+                continue
+            if query not in queries:
+                queries.append(query)
+
+        return queries
+
+    def _parse_analysis(self, decision: str, question: str) -> tuple[bool, List[str], str]:
+        """解析查询分析结果，优先 JSON，失败时做保守兜底。"""
+        try:
+            match = re.search(r"\{.*\}", decision, re.S)
+            data = json.loads(match.group(0) if match else decision)
+            need_search_value = data.get("need_search")
+            if isinstance(need_search_value, str):
+                need_search = need_search_value.strip().lower() in {"true", "yes", "1", "需要", "是"}
+            else:
+                need_search = bool(need_search_value)
+
+            if need_search:
+                queries = self._clean_queries(data.get("queries", []))
+                return True, queries or [question], ""
+
+            reply = data.get("answer") or data.get("reply") or "您好，有什么可以帮您？"
+            return False, [], str(reply).strip()
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+        upper_decision = decision.upper()
+        if "ANSWER" in upper_decision and "RETRIEVE" not in upper_decision:
+            parts = decision.split("|", 1)
+            reply = parts[1].strip() if len(parts) > 1 else "您好，有什么可以帮您？"
+            return False, [], reply
+
+        if "RETRIEVE" in upper_decision:
+            parts = decision.split("|", 1)
+            queries_str = parts[1].strip() if len(parts) > 1 else question
+            return True, self._clean_queries(queries_str) or [question], ""
+
+        if self._is_chitchat(question):
+            return False, [], "您好，有什么可以帮您？"
+
+        return True, [question], ""
+
     # ============================================================
     # 节点 1：分析问题 — 要不要检索？检索什么？
     # ============================================================
     def _analyze(self, state: AgentState) -> AgentState:
         """判断问题类型并生成检索词"""
+        if self._is_chitchat(state["question"]):
+            print(f"   💬 无需检索，直接回复")
+            return {**state, "need_search": False, "answer": "您好，有什么可以帮您？"}
+
         prompt = f"""你是查询分析器。判断用户问题是否需要检索企业文档。
 
 需要检索：问公司制度、政策、规定、流程等具体信息
 不需要检索：闲聊、打招呼、问常识
 
-输出格式：
-- 需要检索: RETRIEVE | 检索词1, 检索词2
-- 不需要: ANSWER | 直接回复的话
+只输出 JSON，不要输出解释文字。
+格式：
+{{"need_search": true, "queries": ["检索词1", "检索词2"], "answer": ""}}
+或
+{{"need_search": false, "queries": [], "answer": "直接回复的话"}}
 
 用户问题：{state['question']}
 你的判断："""
 
         response = self._llm.invoke(prompt)
         decision = response.content.strip()
+        need_search, queries, reply = self._parse_analysis(decision, state["question"])
 
-        if decision.startswith("ANSWER"):
-            parts = decision.split("|", 1)
-            reply = parts[1].strip() if len(parts) > 1 else "好的，有什么可以帮您？"
+        if not need_search:
             print(f"   💬 无需检索，直接回复")
             return {**state, "need_search": False, "answer": reply}
-        else:
-            parts = decision.split("|", 1)
-            queries_str = parts[1].strip() if len(parts) > 1 else state["question"]
-            queries = [q.strip() for q in queries_str.split(",") if q.strip()]
-            print(f"   🧠 需要检索 → 检索词: {queries}")
-            return {**state, "need_search": True, "search_queries": queries}
+
+        print(f"   🧠 需要检索 → 检索词: {queries}")
+        return {**state, "need_search": True, "search_queries": queries}
 
     # ============================================================
     # 节点 2：检索文档
@@ -108,7 +184,13 @@ class AgenticRAG:
         iteration = state["iteration"] + 1
 
         if not docs:
-            return {**state, "iteration": iteration, "answer": "根据现有资料无法回答。"}
+            return {
+                **state,
+                "iteration": iteration,
+                "search_queries": [],
+                "docs_relevant": False,
+                "answer": "根据现有资料无法回答。",
+            }
 
         # 让 LLM 判断文档是否相关
         previews = ""
@@ -130,12 +212,22 @@ class AgenticRAG:
 
         if can_answer:
             print(f"   ✅ 第{iteration}轮评估通过")
-            return {**state, "iteration": iteration, "search_queries": []}  # ← 清空，表示不用再搜
+            return {
+                **state,
+                "iteration": iteration,
+                "search_queries": [],
+                "docs_relevant": True,
+            }  # ← 清空，表示不用再搜
 
 
         if iteration >= state["max_iterations"]:
-            print(f"   ⚠️ 已达最大轮数({state['max_iterations']})，使用当前结果")
-            return {**state, "iteration": iteration}
+            print(f"   ⚠️ 已达最大轮数({state['max_iterations']})，未找到可用文档")
+            return {
+                **state,
+                "iteration": iteration,
+                "docs_relevant": False,
+                "answer": "根据现有资料无法回答。",
+            }
 
         # 换检索词重试
         print(f"   ⚠️ 不相关，重试（{iteration}/{state['max_iterations']}）")
@@ -148,8 +240,7 @@ class AgenticRAG:
 
         response = self._llm.invoke(prompt)
         # 生成新检索词那段，过滤掉过长的"检索词"
-        new_queries = [q.strip() for q in response.content.strip().split(",") if q.strip() and len(q.strip()) < 30]
-        # ← 加了长度过滤，超过30字的"检索词"直接丢弃
+        new_queries = self._clean_queries(response.content)
         print(f"   🔄 新检索词: {new_queries}")
 
         return {
@@ -168,7 +259,7 @@ class AgenticRAG:
             return state
 
         docs = state["docs"]
-        if not docs:
+        if not docs or not state.get("docs_relevant"):
             return {**state, "answer": "根据现有资料无法回答。"}
 
         context = _format_docs(docs[:self.k])
@@ -254,13 +345,24 @@ class AgenticRAG:
             "iteration": 0,
             "max_iterations": self.max_iterations,
             "need_search": False,
+            "docs_relevant": False,
             "answer": "",
         })
 
         sources = []
-        for doc in result.get("docs", [])[:self.k]:
+        seen = set()
+        docs_for_sources = (
+            result.get("docs", [])[:self.k]
+            if result.get("docs_relevant")
+            else []
+        )
+        for doc in docs_for_sources:
+            doc_name = doc.metadata.get("doc_name", "未知")
+            if doc_name in seen:
+                continue
+            seen.add(doc_name)
             sources.append({
-                "doc_name": doc.metadata.get("doc_name", "未知"),
+                "doc_name": doc_name,
                 "preview": doc.page_content[:150],
             })
 
